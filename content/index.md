@@ -1,0 +1,9 @@
+---
+title: Engineering Notes
+---
+
+A personal map of concepts I've learned and refined while building backend systems.
+
+These notes are primarily for myself: a way to structure ideas, connect concepts, and turn practical experience into knowledge I can retrieve and reason about later.
+
+They are not intended to be exhaustive tutorials. They reflect my current understanding and will evolve as that understanding changes.
