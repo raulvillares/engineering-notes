@@ -1,4 +1,10 @@
-# Domain events vs commands in asynchronous workflows
+---
+title: Domain events vs commands in asynchronous workflows
+tags:
+  - asynchrony
+  - queues
+  - publish-subscriber
+---
 
 A queue answers **when** work runs.
 
