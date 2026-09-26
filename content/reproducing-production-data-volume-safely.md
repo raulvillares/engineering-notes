@@ -10,357 +10,353 @@ tags:
 
 # Reproducing Production Data Volume Safely
 
-Cuando un problema aparece únicamente con clientes que tienen mucho volumen de datos, reproducirlo fuera de producción no siempre es trivial.
+When a performance problem only appears for customers with large datasets, reproducing it outside production is not always straightforward.
 
-El objetivo no debería ser necesariamente **copiar producción**, sino conseguir una reproducción suficientemente fiel de la característica que provoca el problema:
+The goal should not necessarily be to **copy production**, but to reproduce the characteristics that actually trigger the problem:
 
-- volumen de filas;
-- distribución de los datos;
-- consultas ejecutadas;
-- índices y planes de ejecución;
-- concurrencia;
-- latencia;
-- comportamiento de la aplicación con datasets grandes.
+- row count;
+- data distribution;
+- query shape;
+- indexes and execution plans;
+- concurrency;
+- latency;
+- application behavior under large datasets.
 
-Dependiendo de lo que se quiera comprobar, existen varias estrategias con distintos niveles de fidelidad, coste y riesgo.
+Different strategies offer different levels of fidelity, safety, and freedom to experiment.
 
-## 1. Probar directamente en producción
+## 1. Test directly in production
 
-La opción con mayor fidelidad es ejecutar el flujo real contra los datos reales.
+The highest-fidelity option is to run the real flow against real production data.
 
-Puede ser útil cuando:
+This can be useful when:
 
-- el problema depende fuertemente del tamaño real de los datos;
-- necesitamos validar un comportamiento muy concreto;
-- no existe una reproducción fiable fuera de producción.
+- the issue depends heavily on the real dataset size;
+- we need to validate a very specific behavior;
+- there is no reliable reproduction outside production.
 
-### Ventajas
+### Advantages
 
-- Máxima fidelidad.
-- Mismos datos, índices, estadísticas y configuración de PostgreSQL.
-- Misma infraestructura.
-- Permite comprobar el comportamiento que realmente experimenta el usuario.
+- Maximum fidelity.
+- Real data, indexes, statistics, and database configuration.
+- Real infrastructure.
+- Lets us observe what users actually experience.
 
-### Problemas
+### Trade-offs
 
-- Riesgo de afectar a producción.
-- Una consulta aparentemente inocua puede consumir muchos recursos.
-- `EXPLAIN ANALYZE` ejecuta realmente la consulta.
-- Las pruebas destructivas o exploratorias quedan descartadas.
-- Es necesario limitar mucho qué se ejecuta y entender previamente su impacto.
+- Risk of affecting production.
+- A read-only query can still consume significant resources.
+- `EXPLAIN ANALYZE`, for example, actually executes the query.
+- Destructive or highly exploratory testing is out of the question.
+- Queries must be well understood and tightly controlled.
 
-Producción puede servir para **observar y medir**, pero no debería convertirse en un entorno de experimentación.
+Production can be a good place to **observe and measure**, but not a general-purpose sandbox.
 
-## 2. Analizar las consultas reales en producción
+## 2. Analyze the real queries in production
 
-Muchas veces no necesitamos reproducir todo el sistema. Podemos reducir el problema hasta identificar las consultas SQL que ejecuta el flujo problemático.
+Often we do not need to reproduce the whole system.
 
-El enfoque general es:
+A better approach can be to reduce the problem until we identify the SQL queries behind the problematic flow.
 
-1. identificar el endpoint o caso de uso implicado;
-2. seguir la ejecución hasta las consultas SQL relevantes;
-3. medir tiempos;
-4. comparar distintos volúmenes o ventanas de datos;
-5. inspeccionar los planes de ejecución mediante `EXPLAIN`;
-6. entender qué parte escala con el volumen.
+A typical process is:
 
-Esta estrategia permite responder preguntas como:
+1. identify the endpoint or use case involved;
+2. follow the execution path down to the relevant SQL;
+3. measure timings;
+4. compare different data volumes or time windows;
+5. inspect query plans with `EXPLAIN`;
+6. identify which operation actually scales with volume.
 
-- ¿qué consulta está consumiendo el tiempo?
-- ¿el coste está en el listado, el `COUNT`, un `SUM`, un join o un cálculo posterior?
-- ¿se utiliza un índice?
-- ¿aparece un sequential scan?
-- ¿el plan cambia al aumentar el rango de datos?
-- ¿el problema sigue existiendo actualmente?
+This can answer questions such as:
 
-### Ventajas
+- Which query is consuming the time?
+- Is the cost in the listing, a `COUNT`, a `SUM`, a join, or application-side processing?
+- Is the expected index being used?
+- Is a sequential scan involved?
+- Does the execution plan change as the dataset grows?
+- Does the original performance problem still exist?
 
-- Trabajamos sobre el dataset real sin copiarlo.
-- Permite aislar el cuello de botella.
-- El riesgo puede mantenerse bajo si las consultas son conocidas y controladas.
-- A menudo es suficiente para verificar si un workaround histórico sigue siendo necesario.
+### Advantages
 
-### Limitaciones
+- Uses the real dataset without copying it.
+- Helps isolate the actual bottleneck.
+- Risk can remain low if queries are known and controlled.
+- Often enough to determine whether a historical workaround is still necessary.
 
-- No reproduce el flujo completo desde la interfaz.
-- No permite experimentar libremente.
-- Una consulta pesada sigue siendo una consulta pesada aunque sea de solo lectura.
-- Los resultados pueden variar según carga, cachés, estadísticas o estado de PostgreSQL.
+### Limitations
 
-### Caso real: Luzo
+- Does not reproduce the complete user flow.
+- Provides little freedom for experimentation.
+- A heavy read query is still heavy.
+- Results can vary depending on cache state, concurrent load, statistics, vacuum state, and other database conditions.
 
-En el caso investigado, una feature flag reducía el rango por defecto de la vista de transacciones de 30 días a 1 día para evitar timeouts en cuentas con mucho volumen.
+### Example
 
-Siguiendo el flujo desde el BFF hasta Core fue posible separar las diferentes partes del coste y medirlas directamente sobre una cuenta con volumen real.
+In one investigation, a feature flag reduced the default transaction history window from 30 days to 1 day because the larger range had historically caused timeouts for high-volume accounts.
 
-La comparación mostró que:
+Instead of cloning production data, the execution path was followed from the API request down to the database operations, and the expensive parts were measured independently.
 
-| Operación | 1 día | 30 días |
+The results were roughly:
+
+| Operation | 1 day | 30 days |
 | --- | ---: | ---: |
-| Página 1 + balances | ~100 ms | ~100 ms |
+| First page + balance calculation | ~100 ms | ~100 ms |
 | `total_count` | 15 ms | 564 ms |
 
-El `COUNT` de 30 días era claramente más caro, pero el flujo completo seguía siendo sub-segundo y no reproducía el timeout original.
+The wider time window made the `COUNT` substantially more expensive, but the full request still remained comfortably below timeout territory.
 
-El plan de ejecución mostró además que el `COUNT` realizaba un `Parallel Seq Scan` sobre las transacciones de la ventana temporal y después comprobaba mediante índice cuáles pertenecían a la cuenta concreta.
+The query plan also showed why: the expensive `COUNT` performed a parallel sequential scan across transactions in the requested time range and then matched the relevant account through an index.
 
-Esto permitió concluir que el workaround histórico ya no parecía necesario para el síntoma que originalmente pretendía evitar.
+The important lesson was not the specific query, but the investigation method:
 
-La enseñanza importante no es el caso concreto, sino el método:
+> Before reproducing all of production, reduce the problem until you know which operation actually scales with data volume.
 
-> Antes de intentar reproducir toda producción, reducir el problema hasta encontrar qué operación escala con el volumen.
+## 3. Generate synthetic data with production-like volume
 
-## 3. Crear datos sintéticos con volumen similar a producción
+Another strategy is to generate an artificial dataset with characteristics similar to the production dataset causing the problem.
 
-Otra estrategia es generar artificialmente un dataset que tenga características parecidas al dataset problemático.
+For example:
 
-Por ejemplo:
+- create a tenant or company;
+- create accounts;
+- generate hundreds of thousands or millions of transactions;
+- preserve a realistic temporal distribution;
+- reproduce relevant entity relationships;
+- run the same application flow against that dataset.
 
-- crear una compañía;
-- crear cuentas;
-- generar cientos de miles o millones de transacciones;
-- mantener una distribución temporal similar;
-- reproducir relaciones entre entidades;
-- ejecutar después el mismo flujo de aplicación.
+The goal is not to copy the real data.
 
-No necesitamos copiar los datos reales. Necesitamos copiar **sus propiedades relevantes**.
+The goal is to reproduce **the properties of the data that matter**.
 
-### Ventajas
+### Advantages
 
-- Sin datos sensibles.
-- Sin riesgo para producción.
-- Podemos modificar y destruir datos libremente.
-- Podemos probar volúmenes incluso superiores a los actuales.
-- Permite encontrar umbrales de degradación.
-- Es fácilmente repetible.
-- Puede convertirse en una herramienta reutilizable de testing.
+- No production data exposure.
+- No production risk.
+- Full freedom to modify or destroy data.
+- Easy to test volumes larger than current production.
+- Useful for finding degradation thresholds.
+- Repeatable.
+- Can become a reusable performance-testing tool.
 
-### Limitaciones
+### Limitations
 
-El volumen por sí solo no garantiza una reproducción realista.
+Volume alone does not guarantee a realistic reproduction.
 
-Un dataset sintético puede diferir de producción en:
+Synthetic data can differ from production in:
 
-- distribución temporal;
-- cardinalidad;
-- relaciones entre tablas;
-- proporción de estados;
-- distribución de valores;
-- checkpoints;
-- estadísticas del planner;
-- fragmentación;
-- concurrencia.
+- temporal distribution;
+- cardinality;
+- relationships between tables;
+- status distribution;
+- value distribution;
+- checkpoints or aggregates;
+- planner statistics;
+- table and index bloat;
+- concurrency patterns.
 
-Por tanto, un buen generador no debería limitarse a crear `N` filas.
+A good generator should therefore do more than create `N` rows.
 
-Debería intentar modelar la **forma de los datos** que afecta a las consultas.
+It should model the **shape of the data** that affects the query.
 
-## 4. Dataset sintético escalable
+## 4. Use scalable synthetic datasets
 
-Una variante especialmente útil consiste en parametrizar el dataset:
+A useful variation is to make the synthetic dataset configurable:
 
 ```text
-small   → 10k movimientos
-medium  → 100k movimientos
-large   → 1M movimientos
-xlarge  → 10M movimientos
+small   → 10k records
+medium  → 100k records
+large   → 1M records
+xlarge  → 10M records
 ```
 
-Esto permite observar cómo evoluciona el rendimiento.
+This changes the question from:
 
-En lugar de preguntar:
+> Is this query slow?
 
-> ¿Esta consulta es lenta?
+to:
 
-podemos preguntar:
+> How does this query behave when the dataset grows by 10x?
 
-> ¿Cómo escala esta consulta cuando el dataset crece 10x?
+This makes it possible to detect:
 
-Esto permite detectar:
+- roughly linear growth;
+- superlinear degradation;
+- query planner changes;
+- sequential scans appearing at certain sizes;
+- indexes no longer being selected;
+- latency thresholds where the behavior becomes unacceptable.
 
-- crecimiento aproximadamente lineal;
-- crecimiento superlineal;
-- cambios en el query planner;
-- aparición de sequential scans;
-- puntos donde deja de utilizarse un índice;
-- umbrales donde la latencia deja de ser aceptable.
+This is particularly useful for studying **scalability**, not only for reproducing incidents.
 
-Esta aproximación es especialmente útil para estudiar **scalability**, no únicamente para reproducir incidentes.
+## 5. Restore a production dump locally
 
-## 5. Restaurar un dump de producción en local
+Another option is to restore a production database dump into a local or isolated environment.
 
-Otra posibilidad es restaurar una copia de producción en una base de datos local o aislada.
+### Advantages
 
-### Ventajas
+- Highly realistic dataset.
+- Full freedom to experiment.
+- Safe to modify records, feature flags, and indexes after restoration.
+- Experiments do not affect the live system.
 
-- Dataset muy realista.
-- Libertad total para experimentar.
-- Permite modificar registros, flags e índices.
-- No afecta a producción durante las pruebas.
+### Trade-offs
 
-### Problemas
+Creating the dump itself can place meaningful load on the primary database.
 
-En nuestro entorno esta opción se considera inadecuada por dos motivos.
+It also introduces the operational and security cost of copying production data into another environment:
 
-Primero, generar el dump puede introducir carga significativa sobre la base de datos primaria.
+- privacy concerns;
+- security concerns;
+- compliance requirements;
+- credential management;
+- accidental persistence of sensitive data.
 
-Segundo, implica copiar datos reales de producción a otro entorno, lo que añade riesgos de:
+Even when technically possible, this should not be treated as the default option.
 
-- privacidad;
-- seguridad;
-- cumplimiento;
-- gestión de credenciales;
-- persistencia accidental de datos sensibles.
+## 6. Restore a dump from a read replica
 
-Aunque técnicamente sea una estrategia válida, no debería asumirse que es una opción disponible.
+If a read replica exists, a dump can be taken from the replica instead of the primary.
 
-## 6. Restaurar un dump desde una réplica
+This reduces direct pressure on the primary database.
 
-Si existe una réplica de lectura, el dump puede obtenerse desde ella en lugar de hacerlo desde la primaria.
+### Advantages
 
-Esto reduce el impacto sobre la base de datos principal.
+- Realistic dataset.
+- Lower operational risk for the primary.
+- Full freedom to experiment after restoring it elsewhere.
 
-### Ventajas
+### Limitations
 
-- Dataset real.
-- Menor riesgo operativo para la primaria.
-- Permite posteriormente experimentar en un entorno aislado.
+- Production data still leaves the production environment.
+- The replica still has finite capacity.
+- Replication lag may matter.
+- Access may be restricted.
 
-### Limitaciones
+This addresses part of the operational risk, but not the risks associated with copying production data.
 
-- Sigue existiendo el problema de copiar datos reales.
-- La réplica también tiene capacidad limitada.
-- Puede existir replication lag.
-- Necesitamos acceso a esa infraestructura.
+## 7. Connect a local application to a production database
 
-Por tanto, elimina parte del riesgo operativo pero no los riesgos asociados a datos productivos.
+It may be technically possible to run a local application against a production database or read replica.
 
-## 7. Conectar una aplicación local a la base de datos de producción
+This gives local code access to the real dataset.
 
-Técnicamente podría ejecutarse Core o Control Panel en local apuntando a una base de datos productiva o a una réplica.
+It is also a particularly risky approach.
 
-Esto permite utilizar el código local sobre datos reales.
+### Risks
 
-Sin embargo, conectar una aplicación local a producción es una práctica especialmente peligrosa.
+- accidental writes;
+- callbacks or background jobs running unexpectedly;
+- local code differing from deployed code;
+- migrations;
+- scripts or commands targeting the wrong environment;
+- expensive experimental queries.
 
-### Riesgos
+Even with read-only credentials, there is still a risk of creating unwanted load.
 
-- ejecutar accidentalmente escrituras;
-- jobs o callbacks inesperados;
-- código local diferente del desplegado;
-- migraciones;
-- scripts o comandos ejecutados contra el entorno equivocado;
-- consultas experimentales demasiado caras.
+For this reason, this approach is often better avoided entirely.
 
-Incluso con acceso read-only, sigue existiendo riesgo de generar carga.
+## 8. Use a read replica for analysis
 
-Por estos motivos, en nuestro entorno esta alternativa se descarta.
-
-## 8. Utilizar una réplica de lectura para análisis
-
-Una réplica puede ser útil para:
+A read replica can be useful for:
 
 - `EXPLAIN`;
-- análisis exploratorio;
-- consultas de volumen;
-- validación de índices;
-- medición de consultas costosas.
+- exploratory analysis;
+- volume queries;
+- index validation;
+- measuring expensive reads.
 
-Tiene la ventaja de separar parte de la carga de la primaria.
+It provides some isolation from the primary database.
 
-Pero una réplica tampoco debería tratarse como un sandbox infinito: sigue siendo infraestructura compartida y puede afectar a replicación, reporting u otros consumidores.
+However, a replica should not be treated as an unlimited sandbox. Heavy queries can still affect replication, reporting workloads, analytics, or other consumers.
 
-## Comparativa
+## Comparison
 
-| Estrategia | Fidelidad | Riesgo para producción | Libertad para experimentar | Datos reales |
+| Strategy | Fidelity | Risk to production | Freedom to experiment | Real data |
 | --- | --- | --- | --- | --- |
-| Flujo completo en producción | Muy alta | Alto | Muy baja | Sí |
-| SQL controlado en producción | Alta | Bajo–medio | Baja | Sí |
-| SQL sobre réplica | Alta | Bajo | Media | Sí |
-| Aplicación local → producción | Alta | Alto | Media | Sí |
-| Dump producción → local | Alta | Medio durante el dump | Muy alta | Sí |
-| Dump réplica → local | Alta | Bajo–medio | Muy alta | Sí |
-| Datos sintéticos | Media–alta | Ninguno | Muy alta | No |
+| Full flow in production | Very high | High | Very low | Yes |
+| Controlled SQL in production | High | Low–medium | Low | Yes |
+| SQL on a read replica | High | Low | Medium | Yes |
+| Local app → production DB | High | High | Medium | Yes |
+| Production dump → local | High | Medium during dump | Very high | Yes |
+| Replica dump → local | High | Low–medium | Very high | Yes |
+| Synthetic data | Medium–high | None | Very high | No |
 
-No existe una estrategia universalmente mejor.
+There is no universally best strategy.
 
-La elección depende de **qué propiedad del problema necesitamos reproducir**.
+The right choice depends on **which property of production we actually need to reproduce**.
 
-## Estrategia práctica
+## A practical investigation sequence
 
-Una secuencia razonable de investigación es:
+### 1. Reduce the problem
 
-### 1. Reducir el problema
+Before moving large amounts of data around, determine:
 
-Antes de mover grandes cantidades de datos, averiguar:
+- which endpoint is slow;
+- which use case it triggers;
+- which SQL queries it generates;
+- which operations depend on data volume.
 
-- qué endpoint falla;
-- qué caso de uso ejecuta;
-- qué queries genera;
-- qué operaciones dependen del volumen.
+### 2. Measure against real data in a controlled way
 
-### 2. Medir con datos reales de forma controlada
+If safe, collect timings for the relevant queries using production or a read replica.
 
-Si es seguro, obtener métricas de las consultas relevantes usando producción o una réplica.
+The goal is to identify the bottleneck, not to perform arbitrary experiments.
 
-El objetivo es identificar el cuello de botella, no hacer pruebas arbitrarias.
+### 3. Understand the execution plan
 
-### 3. Entender el plan de ejecución
-
-`EXPLAIN` puede revelar:
+`EXPLAIN` can reveal:
 
 - sequential scans;
-- joins costosos;
-- estimaciones erróneas;
-- índices utilizados;
-- número de filas esperado;
-- coste relativo de cada operación.
+- expensive joins;
+- incorrect cardinality estimates;
+- which indexes are being used;
+- expected row counts;
+- relative cost of different plan nodes.
 
-### 4. Construir un dataset sintético
+### 4. Build a synthetic dataset
 
-Una vez entendida la forma del problema, reproducirla localmente:
+Once the relevant data shape is understood, reproduce it locally:
 
 ```text
-datos sintéticos
-        ↓
-volumen equivalente o superior a producción
-        ↓
-mismo flujo de Core
-        ↓
-mismo flujo de Control Panel
+synthetic data
+      ↓
+production-like or larger volume
+      ↓
+same backend flow
+      ↓
+same application behavior
 ```
 
-### 5. Buscar el límite
+### 5. Find the breaking point
 
-No limitarse a reproducir el volumen actual.
+Do not stop at the current production volume.
 
-Probar también:
+Test larger datasets too:
 
 ```text
-1x volumen actual
+1x current production volume
 2x
 5x
 10x
 ```
 
-Así podemos comprobar si estamos corrigiendo el problema actual o diseñando algo capaz de escalar.
+This helps distinguish between a fix for today's incident and a design that scales.
 
-## Idea clave
+## Key idea
 
-Reproducir producción no significa necesariamente **copiar producción**.
+Reproducing production does not necessarily mean **copying production**.
 
-En problemas de rendimiento interesa identificar qué dimensiones del entorno productivo son relevantes y reproducirlas de la forma más segura posible.
+For performance investigations, the important question is which dimensions of the production environment actually matter, and how to reproduce those dimensions safely.
 
-A veces basta con analizar las consultas reales.
+Sometimes analyzing the real queries is enough.
 
-Otras veces necesitamos reproducir la distribución y volumen mediante datos sintéticos.
+Sometimes we need production-like synthetic data.
 
-Y solo en último término necesitamos ejecutar el flujo real sobre infraestructura productiva.
+Only in the most constrained cases do we need to run the full flow against live production infrastructure.
 
-La pregunta útil no es:
+The useful question is not:
 
-> ¿Cómo puedo tener producción en local?
+> How can I get production locally?
 
-sino:
+It is:
 
-> ¿Qué característica de producción necesito reproducir para que aparezca el mismo problema?
+> Which property of production do I need to reproduce for the same problem to appear?
